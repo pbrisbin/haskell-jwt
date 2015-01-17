@@ -43,6 +43,7 @@ module Web.JWT
     -- ** Common
     , tokenIssuer
     , secret
+    , secretFromSecureMeme
     -- ** JWT structure
     , claims
     , header
@@ -78,6 +79,8 @@ import qualified Data.ByteString.Lazy.Char8 as BL (fromStrict, toStrict)
 import qualified Data.Text                  as T
 import qualified Data.Text.Encoding         as TE
 
+import           Data.SecureMem
+import           Data.Byteable
 import           Control.Applicative
 import           Control.Monad
 import qualified Crypto.Hash.SHA256         as SHA
@@ -94,11 +97,10 @@ import qualified Network.URI                as URI
 import           Web.Base64
 import           Prelude                    hiding (exp)
 
-
 type JSON = T.Text
 
 -- | The secret used for calculating the message signature
-newtype Secret = Secret T.Text deriving (Eq, Show)
+newtype Secret = Secret SecureMem deriving (Eq, Show)
 
 newtype Signature = Signature T.Text deriving (Eq, Show)
 
@@ -225,13 +227,13 @@ instance Default JWTClaimsSet where
 -- :}
 -- "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJodHRwOi8vZXhhbXBsZS5jb20vaXNfcm9vdCI6dHJ1ZSwiaXNzIjoiRm9vIn0.vHQHuG3ujbnBUmEp-fSUtYxk27rLiP2hrNhxpyWhb2E"
 encodeSigned :: Algorithm -> Secret -> JWTClaimsSet -> JSON
-encodeSigned algo secret claims = dotted [header, claim, signature]
-    where claim     = encodeJWT claims
-          header    = encodeJWT def {
+encodeSigned algo secret' claims' = dotted [header', claim, signature']
+    where claim     = encodeJWT claims'
+          header'   = encodeJWT def {
                         typ = Just "JWT"
                       , alg = Just algo
                       }
-          signature = calculateDigest algo secret (dotted [header, claim])
+          signature' = calculateDigest algo secret' (dotted [header', claim])
 
 -- | Encode a claims set without signing it
 --
@@ -246,9 +248,9 @@ encodeSigned algo secret claims = dotted [header, claim, signature]
 -- :}
 -- "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpYXQiOjEzOTQ3MDA5MzQsImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlLCJpc3MiOiJGb28ifQ."
 encodeUnsigned :: JWTClaimsSet -> JSON
-encodeUnsigned claims = dotted [header, claim, ""]
-    where claim     = encodeJWT claims
-          header    = encodeJWT def {
+encodeUnsigned claims' = dotted [header', claim, ""]
+    where claim     = encodeJWT claims'
+          header'   = encodeJWT def {
                         typ = Just "JWT"
                       , alg = Just HS256
                       }
@@ -281,10 +283,14 @@ decode input = do
     (h,c,s) <- extractElems $ T.splitOn "." input
     let header' = parseJWT h
         claims' = parseJWT c
-    Unverified <$> header' <*> claims' <*> (pure . Signature $ s) <*> (pure . dotted $ [h,c])
+    Unverified <$> header' <*> claims' <*> (pure $ Signature s) <*> (pure . dotted $ [h,c])
     where
         extractElems (h:c:s:_) = Just (h,c,s)
         extractElems _       = Nothing
+
+instance ToSecureMem T.Text where
+    toSecureMem = secureMemFromByteString . TE.encodeUtf8
+
 
 -- | Using a known secret and a decoded claims set verify that the signature is correct
 -- and return a verified JWT token as a result.
@@ -310,8 +316,13 @@ verify :: Secret -> JWT UnverifiedJWT -> Maybe (JWT VerifiedJWT)
 verify secret' (Unverified header' claims' unverifiedSignature originalClaim) = do
    algo <- alg header'
    let calculatedSignature = Signature $ calculateDigest algo secret' originalClaim
-   guard (unverifiedSignature == calculatedSignature)
+   guard (unverifiedSignature `constEq` calculatedSignature)
    pure $ Verified header' claims' calculatedSignature
+  where
+    -- constant time comparison
+    {-constEq (Signature s1) (Signature s2) = s1 == s2-}
+    -- constEq (Signature s1) (Signature s2) = trace ("s1: " ++ show s1 ++ ", s2: " ++ show s2 ++ ", s1 == s2: " ++ show (s1 == s2) ++ ", sec1 == sec2: " ++ show ((toSecureMem s1) == (toSecureMem s2))) $ (toSecureMem s1) == (toSecureMem s2)
+    constEq (Signature s1) (Signature s2) = (toSecureMem s1) == (toSecureMem s2)
 
 -- | Decode a claims set and verify that the signature matches by using the supplied secret.
 -- The algorithm is based on the supplied header value.
@@ -338,7 +349,12 @@ tokenIssuer = decode >=> fmap pure claims >=> iss
 -- return a Nothing in the future if the key needs to adhere to a specific
 -- format and the given key is invalid.
 secret :: T.Text -> Secret
-secret = Secret
+secret = Secret . toSecureMem
+
+-- | Create a Secret using the given key that is a `SecureMem`. See
+-- `secret`.
+secretFromSecureMeme :: SecureMem -> Secret
+secretFromSecureMeme = Secret
 
 -- | Convert the `NominalDiffTime` into an IntDate. Returns a Nothing if the
 -- argument is invalid (e.g. the NominalDiffTime must be convertible into a
@@ -384,8 +400,11 @@ dotted = T.intercalate "."
 -- =================================================================================
 
 calculateDigest :: Algorithm -> Secret -> T.Text -> T.Text
-calculateDigest _ (Secret key) msg = base64Encode' $ HMAC.hmac SHA.hash 64 (bs key) (bs msg)
-    where bs = TE.encodeUtf8
+calculateDigest _ (Secret key) msg = base64Encode' $ HMAC.hmac SHA.hash 64 (fromSecureMem key) (bs msg)
+    where
+      fromSecureMem = toBytes -- TE.encodeUtf8 . toBytes
+      bs = TE.encodeUtf8
+
 
 -- =================================================================================
 

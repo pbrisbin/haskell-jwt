@@ -14,9 +14,12 @@ import           Test.Tasty.QuickCheck
 import qualified Test.QuickCheck as QC
 import qualified Data.Map              as Map
 import qualified Data.Text             as T
+import qualified Data.Text.Encoding    as TE
 import qualified Data.Text.Lazy        as TL
 import           Data.Aeson.Types
 import           Data.Maybe
+import           Data.SecureMem
+import           Data.Byteable
 import           Data.String (fromString, IsString)
 import           Data.Time
 import           Web.JWT
@@ -55,13 +58,13 @@ case_decodeJWT = do
     Just "payload" @=? Map.lookup "some" (unregisteredClaims $ claims unverified)
 
 case_verify = do
-    -- Generated with ruby-jwt
+    -- Generated with ruby-jwt `JWT.encode({"some" => "payload"}, "secret")`
     let input = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzb21lIjoicGF5bG9hZCJ9.Joh1R2dYzkRvDkqv3sygm5YyK8Gi4ShZqbhK2gxcs2U"
         mVerified = verify (secret "secret") =<< decode input
     True @=? isJust mVerified
 
 case_decodeAndVerifyJWT = do
-    -- Generated with ruby-jwt
+    -- Generated with ruby-jwt `JWT.encode({"some" => "payload"}, "secret")`
     let input = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzb21lIjoicGF5bG9hZCJ9.Joh1R2dYzkRvDkqv3sygm5YyK8Gi4ShZqbhK2gxcs2U"
         mJwt = decodeAndVerifySignature (secret "secret") input
     True @=? isJust mJwt
@@ -70,7 +73,8 @@ case_decodeAndVerifyJWT = do
     Just "payload" @=? Map.lookup "some" (unregisteredClaims $ claims verified)
 
 case_decodeAndVerifyJWTFailing = do
-    -- Generated with ruby-jwt, modified to be invalid
+    -- Generated with ruby-jwt, modified to be invalid (note the lowercase 'u' at the end compare to the 
+    -- uppercase 'U' in the input in case_decodeAndVerifyJWT)
     let input = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzb21lIjoicGF5bG9hZCJ9.Joh1R2dYzkRvDkqv3sygm5YyK8Gi4ShZqbhK2gxcs2u"
         mJwt = decodeAndVerifySignature (secret "secret") input
     False @=? isJust mJwt
@@ -164,6 +168,33 @@ case_encodeDecodeJWTClaimsSetWithMultipleAud = do
     let secret' = secret "secret"
         jwt = decodeAndVerifySignature secret' $ encodeSigned HS256 secret' cs
     Just cs @=? fmap claims jwt
+
+prop_secureMemEncodeDecode = f
+  where
+    f :: T.Text -> Bool
+    f t = t == (secureMemToText $ toSecureMem t)
+    secureMemToText :: SecureMem -> T.Text
+    secureMemToText = TE.decodeUtf8 . toBytes
+
+prop_secureMemEq = f
+  where
+    f :: T.Text -> T.Text -> Bool
+    f t1 t2 = let eqt = t1 == t2
+                  eqs = (toSecureMem t1) == (toSecureMem t2)
+              in eqt == eqs
+    secureMemToText :: SecureMem -> T.Text
+    secureMemToText = TE.decodeUtf8 . toBytes
+
+prop_secureMemEq' = f
+  where
+    f :: T.Text -> T.Text -> Bool
+    f tl tr = let t1 = ("Joh1R2dYzkRvDkqv3sygm5YyK8Gi4ShZqbhK2gxcs2" :: T.Text) `T.append` tl
+                  t2 = ("Joh1R2dYzkRvDkqv3sygm5YyK8Gi4ShZqbhK2gxcs2" :: T.Text) `T.append` tr
+                  eqt = t1 == t2
+                  eqs = (toSecureMem t1) == (toSecureMem t2)
+              in eqt == eqs
+    secureMemToText :: SecureMem -> T.Text
+    secureMemToText = TE.decodeUtf8 . toBytes
 
 prop_stringOrURIProp = f
     where f :: StringOrURI -> Bool
