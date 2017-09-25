@@ -41,6 +41,7 @@ module Web.JWT
     , tokenIssuer
     , secret
     , binarySecret
+    , rsaKeySecret
     -- ** JWT structure
     , claims
     , header
@@ -81,6 +82,7 @@ import qualified Data.ByteString.Extended as BS
 import qualified Data.Text.Extended         as T
 import qualified Data.Text.Encoding         as TE
 
+import           Codec.Crypto.RSA           (PrivateKey(..), PublicKey(..), sign)
 import           Control.Applicative
 import           Control.Monad
 import           Crypto.Hash.Algorithms
@@ -95,6 +97,22 @@ import           Data.Maybe
 import           Data.Scientific
 import           Data.Time.Clock            (NominalDiffTime)
 import qualified Network.URI                as URI
+import           OpenSSL.EVP.PKey           (toKeyPair)
+import           OpenSSL.PEM                (PemPasswordSupply(..), readPrivateKey)
+import           OpenSSL.RSA
+    ( RSAKeyPair
+    , RSAPubKey
+    , rsaCopyPublic
+    , rsaD
+    , rsaDMP1
+    , rsaDMQ1
+    , rsaE
+    , rsaIQMP
+    , rsaN
+    , rsaP
+    , rsaQ
+    , rsaSize
+    )
 import           Prelude                    hiding (exp)
 
 -- $setup
@@ -109,10 +127,9 @@ type JSON = T.Text
 type JWTHeader = JOSEHeader
 
 -- | The secret used for calculating the message signature
-newtype Secret = Secret BS.ByteString
-
-instance Eq Secret where
-    (Secret s1) == (Secret s2) = s1 `BS.constTimeCompare` s2
+data Secret
+    = Secret BS.ByteString -- ^ A textual key, for use with @'HS256'@
+    | RSAKey PrivateKey    -- ^ An RSA Private key, for use with @'RS256'@
 
 instance Show Secret where
     show _ = "<secret>"
@@ -177,6 +194,7 @@ instance Show StringOrURI where
     show (U u) = show u
 
 data Algorithm = HS256 -- ^ HMAC using SHA-256 hash algorithm
+               | RS256 -- ^ RSA using SHA-256 hash algorithm
                  deriving (Eq, Show)
 
 -- | JOSE Header, describes the cryptographic operations applied to the JWT
@@ -364,6 +382,32 @@ secret = Secret . TE.encodeUtf8
 binarySecret :: BS.ByteString -> Secret
 binarySecret = Secret
 
+-- | Create an RSAKey from PEM contents
+--
+-- > rsaKeySecret =<< readFile "foo.pem"
+--
+rsaKeySecret :: String -> IO (Maybe Secret)
+rsaKeySecret k = do
+    mKeyPair <- toKeyPair <$> readPrivateKey k PwNone
+    mPublicKey <- mapM rsaCopyPublic mKeyPair
+    return $ RSAKey <$>
+        (fromRSAKey <$> mKeyPair <*> mPublicKey)
+  where
+    fromRSAKey :: RSAKeyPair -> RSAPubKey -> PrivateKey
+    fromRSAKey kp pk = PrivateKey
+        { private_pub = PublicKey
+            { public_size = rsaSize pk
+            , public_n = rsaN pk
+            , public_e = rsaE pk
+            }
+        , private_d = rsaD kp
+        , private_p = rsaP kp
+        , private_q = rsaQ kp
+        , private_dP = fromMaybe 0 $ rsaDMP1 kp
+        , private_dQ = fromMaybe 0 $ rsaDMQ1 kp
+        , private_qinv = fromMaybe 0 $ rsaIQMP kp
+        }
+
 -- | Convert the `NominalDiffTime` into an IntDate. Returns a Nothing if the
 -- argument is invalid (e.g. the NominalDiffTime must be convertible into a
 -- positive Integer representing the seconds since epoch).
@@ -417,9 +461,17 @@ dotted = T.intercalate "."
 -- =================================================================================
 
 calculateDigest :: Algorithm -> Secret -> T.Text -> T.Text
-calculateDigest HS256 (Secret key) msg = TE.decodeUtf8 $ convertToBase Base64URLUnpadded (hmac key (bs msg) :: HMAC SHA256)
-    where 
-        bs = TE.encodeUtf8
+calculateDigest HS256 (Secret key) msg =
+    TE.decodeUtf8 $ convertToBase Base64URLUnpadded (hmac key (TE.encodeUtf8 msg) :: HMAC SHA256)
+
+calculateDigest RS256 (RSAKey key) msg = TE.decodeUtf8
+    $ convertToBase Base64URLUnpadded
+    $ BL.toStrict
+    $ sign key
+    $ BL.fromStrict
+    $ TE.encodeUtf8 msg
+
+calculateDigest _ _ _ = error "Invalid use of calculateDigest"
 
 -- =================================================================================
 
@@ -482,9 +534,11 @@ instance FromJSON NumericDate where
 
 instance ToJSON Algorithm where
     toJSON HS256 = String ("HS256"::T.Text)
+    toJSON RS256 = String ("RS256"::T.Text)
 
 instance FromJSON Algorithm where
     parseJSON (String "HS256") = return HS256
+    parseJSON (String "RS256") = return RS256
     parseJSON _                = mzero
 
 instance ToJSON StringOrURI where
